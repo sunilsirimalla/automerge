@@ -1,0 +1,142 @@
+#!groovy
+	import groovy.json.JsonSlurper
+	@Library('com.optum.jenkins.pipeline.library@stable') _
+	// Global Variables
+	String credentialsId = params.credentialsId ?: 'svc_account'
+	/**
+	* Perform a Git merge from the Source branch to the Target branch for the given Git URL
+	* Parameters:
+	* SOURCE_BRANCH: A mandatory comma delimited list of either regex or plaintext Strings to be merged into the target branch(es)
+	* TARGET_BRANCH: A mandatory comma delimited list of either regex or plaintext Strings for the source branch(es) to be merged into
+	* GIT_URL: Mandatory parameter, the Git URL in which the merge is being performed
+	* MSID_ARRAY: A mandatory comma delimited list of MSIDs that have access to the project and will be added to any pull requests that are created as a result of the automerge
+	*/
+	pipeline {
+	    agent { label 'docker-maven-slave' }
+	    stages {
+	        stage('Automerge Branches') {
+	            steps {
+	                script {
+	                    withCredentials([usernamePassword(credentialsId: credentialsId, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASSWORD')]) {
+	                        command "rm -rf .git"
+	 
+	                        def versioningUtilities = load 'utilities/GitUtilities.groovy'
+	                        versioningUtilities.performGitCheckoutWithSubModule('master', credentialsId, params.GIT_URL)
+	 
+	                        command """
+	                            # Set up configuration for automerge logic
+	                            git config user.name "${GIT_USER}"
+	                            git config user.email "${GIT_USER}@optum.com"
+
+	                            git prune
+	                         """
+	 
+	                        String[] sourceBranchList = []
+	                        // Get all branches that follow each source branch name and add them to the source branch list
+	                        // This accounts for both regex and plaintext Strings
+	                        params.SOURCE_BRANCH.split(',').each { String source ->
+	                            source = source.trim() // Trim whitespace
+	                            String branches = sh(script: "git branch -r --list origin/${source}", returnStdout: true).trim()
+	                            sourceBranchList += branches.split('\n ')
+	                        }
+	 
+	                        String[] targetBranchList = []
+	                        // Do the same for target branches
+	                        params.TARGET_BRANCH.split(',').each { String target ->
+	                            target = target.trim() // Trim whitespace
+	                            String branches = sh(script: "git branch -r --list origin/${target}", returnStdout: true).trim()
+	                            targetBranchList += branches.split('\n ')
+	                        }
+	 
+	                        // Iterate through each source branch and each target branch to perform merge logic
+	                        sourceBranchList.each { String source ->
+	                            source = source.trim() // Trim whitespace
+	                            // Remove origin, Jenkins doesn't like it
+	                            source = source.replaceAll('origin/', '')/
+	                            targetBranchList.each { String target ->
+	                                target = target.trim() // Trim whitespace
+	                                // Remove origin, Jenkins doesn't like it
+	                                target = target.replaceAll('origin/', '')
+	                                try {
+	                                    command """
+	                                        # First checkout our source branch, then our target one to make sure we have the latest from our repo
+	                                        git checkout ${source}
+	                                        git checkout ${target}
+	                                        git pull
+	                                        # Try to perform a merge, if it fails, abort and reset so we can create a merge conflict PR
+	                                        if git merge ${source} ; then
+	                                           set +x
+	                                           git push https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@${params.GIT_URL}.git ${target}
+	                                           set -x
+	                                        else
+	                                            git merge --abort
+	                                            git reset --hard
+	                                            exit 1
+	                                        fi
+	                                    """
+	                                }
+	                                catch (Exception e) {
+	                                    // If we got here, we caught a merge conflict. Create a PR and add reviewers
+	                                    String[] msids = params.MSID_ARRAY.split(',') // Splits at the comma into a String[]
+	                                    String msidList = ""
+	                                    for (int i = 0; i < msids.length; i++) {
+	                                        if (i == msids.length-1) {
+	                                            // If this is the last string, don't add a comma
+	                                            msidList += "\"" + msids[i] + "\""
+	                                        }
+	                                        else {
+	                                            msidList += "\"" + msids[i] + "\","
+	                                        }
+	                                    }
+	                                    String[] gitParsed = params.GIT_URL.split('/') // index 1 is the org, index 2 is the project
+	                                    String newBranch = "automerge/${source}_to_${target}"
+	 
+	                                    // Determine userId for the source branch
+	                                    def slurper = new JsonSlurper()
+	                                    String getHash = sh(script: "git log origin/${source} | head -1", returnStdout: true).trim()
+	                                    def sha = getHash.replaceAll('commit ', '').trim()
+	                                    def ownerRepo = params.GIT_URL.replaceAll('github.optum.com/','')
+	                                    def userID = sh(script: "curl https://github.optum.com/api/v3/repos/${ownerRepo}/commits/${sha}", returnStdout: true).trim()
+	                                    def commitUserName = ''
+	                                    def prBody = ""
+	                                    if (userID) {
+	                                        commitUserName = slurper.parseText(userID)?.getAt("author")?.getAt("login")
+	                                    }
+	 
+	                                    if (commitUserName) {
+	                                        commitUserName = '@' + commitUserName
+	                                        prBody = "<h2>There was a merge conflict</h2> <h3>When:</h3> Conflict when automatically merging <code><b>${source}</b></code> --> <code><b>${target}</b></code>. <br/> <h3>Who:</h3> Hey ${commitUserName}, you last committed to <code><b>${source}</b></code>. Please check it out :eyes:"
+	                                    } else {
+	                                        prBody = "<h2>There was a merge conflict</h2> <h3>When:</h3> Conflict when automatically merging <code><b>${source}</b></code> --> <code><b>${target}</b></code>. <br/><br/> Please check it out :eyes:"
+	                                    }
+	                                    command """
+	                                        # Throw the exception away, for Jenkins all it says is that an error has occurred in a script
+	                                        echo ${e} > /dev/null
+	                                        git checkout ${source}
+	                                        git checkout -b ${newBranch}
+	                                        set +e # Don't fail if non-zero exit code
+	                                        set -x # Hide outputs for password secrecy
+	
+	                                        # Outputs 0 if branch exits, 2 otherwise
+	                                        set +x
+	                                        git ls-remote --heads --exit-code https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@${params.GIT_URL}.git ${newBranch}
+	                                        if [[ "\$?" == 2 ]];
+	                                        then # If branch doesn't currently exist, create the PR
+	                                            git push --set-upstream https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@${params.GIT_URL}.git ${newBranch}
+	                                            curl -s -u ${GIT_USER}:${GIT_PASSWORD} -d '{"reviewers": [${msidList}]}' \$(curl -u ${GIT_USER}:${GIT_PASSWORD} -d '{"title": "Merge conflict from ${source} to ${target}", "body": "There was a merge conflict when automatically merging ${source} to ${target}. Please check it out", "head": "${newBranch}", "base": "${target}", "maintainer_can_modify": true}' https://github.optum.com/api/v3/repos/${gitParsed[1]}/${gitParsed[2]}/pulls | jq -r '.url')/requested_reviewers
+	                                        else # If branch does exist, just push new code to it
+	                                            git pull origin ${newBranch} || true
+	                                            git push https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@${params.GIT_URL}.git ${newBranch}
+	                                        fi
+	                                        set -e
+	                                        set -x
+	                                    """
+	                                }
+	                            }
+	                        }
+	                    }
+	                }
+	            }
+	        }
+	    }
+	}
