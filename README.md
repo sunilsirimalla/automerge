@@ -18,3 +18,7 @@ git checkout -b "mergecflice+dt"
 git pull request""
 send to the mail merge confili mail branch details
 endif
+
+
+#curl command for pr creation - test if this works
+# curl -XPOST -d '{"title":"pr creation check", "base":"https://github.com/sunilsirimalla/test/tree/main", "head":"https://github.com/sunilsirimalla/test/tree/branch3", "body":"testing manual pr creation"' https://github.com/api/v3/repos/sunilsirimalla/test/pulls
