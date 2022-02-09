@@ -1,0 +1,39 @@
+@groovy.transform.Field
+def backendRepoNamesArray = [
+    'ois-app',
+    'ois-base',
+    'ois-data-services',
+    'ois-security-services',
+    'ois-document-services',
+    'ois-user-api',
+    'ois-referencedata-api',
+    'ois-alliance-api',
+    'ois-timetracking-api',
+    'ois-managerefdata-api',
+    'ois-manageformletters-api',
+    'ois-establishment-api',
+    'ois-complianceassistance-api',
+    'ois-enforcement-api',
+    'ois-formlettersdocgen-services',
+    'ois-sampling-api',
+    'ois-selfsampling-api',
+    'ois-penaltycalculator-services',
+    'ois-dcatfunctions-api',
+    'ois-proxy',
+    'ois-consultation-api'
+]
+
+
+
+
+ stages () {
+            stage ('Clone BE') {
+              steps {
+                script {
+                  shared.backendRepoNamesArray.each {
+                      shared.cloneRepo(it, env.BRANCH_NAME, GIT_URL, GIT_CREDENTIALS_ID)
+                  }
+                  shared.checkAndPopulateLocalArtifactoryRepo(ARTIFACTORY_SERVER_ID, ARTIFACTORY_REPO_NAME_LOCAL ) 
+                }
+              }
+            }
