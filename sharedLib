@@ -1,0 +1,422 @@
+
+//// VARIABLES
+
+
+// Defining the array here because env vars are String only.
+@groovy.transform.Field
+def backendRepoNamesArray = [
+    'ois-app',
+    'ois-base',
+    'ois-data-services',
+    'ois-security-services',
+    'ois-document-services',
+    'ois-user-api',
+    'ois-referencedata-api',
+    'ois-alliance-api',
+    'ois-timetracking-api',
+    'ois-managerefdata-api',
+    'ois-manageformletters-api',
+    'ois-establishment-api',
+    'ois-complianceassistance-api',
+    'ois-enforcement-api',
+    'ois-formlettersdocgen-services',
+    'ois-sampling-api',
+    'ois-selfsampling-api',
+    'ois-penaltycalculator-services',
+    'ois-dcatfunctions-api',
+    'ois-proxy',
+    'ois-consultation-api'
+]
+
+@groovy.transform.Field
+def serverCredentialsID = 'osha-ois-jenkins-ssh'
+//def serverCredentialsID = 'qat3-jenkins-ssh'
+
+@groovy.transform.Field
+def serverCredentialsUser = 'appadmin'
+//def serverCredentialsUser = 'tomcat'
+
+
+@groovy.transform.Field
+def rmDirsExceptManager = 'find . -type d -not -name  "host-manager" -not -name "manager" -mindepth 1 -maxdepth 1 -exec rm -rf "{}" \\;'
+
+// // FUNCTIONS
+
+def cloneRepo(repoName, BRANCH_NAME, GIT_URL, GIT_CREDENTIALS_ID) {
+  dir ("${repoName}") {
+    // sh "echo \"Cloning ${repoName}...\""
+
+    // Shallow cloning for increased speed.
+    // On 2021-May-20, shallow stopped working at DOL.  Switching shallow to false.
+    checkout([
+      $class: 'GitSCM',
+      branches: [[name: "*/${BRANCH_NAME}"]],
+      doGenerateSubmoduleConfigurations: false,
+      extensions: [[
+        $class: 'CloneOption',
+        noTags: true,
+        reference: '',
+        shallow: false
+      ]],
+      submoduleCfg: [],
+      userRemoteConfigs: [[
+        credentialsId: "${GIT_CREDENTIALS_ID}",
+        url: "${GIT_URL}/${repoName}.git"
+        // url: "${GIT_URL.substring(0, GIT_URL.lastIndexOf('/'))}/${repoName}.git"
+      ]]
+    ])
+  }
+}
+
+def getInputBuildOption () {
+  // If no input, then stop.
+  timeout(time: 60, unit: 'SECONDS') {
+    def buildOption = input( id: 'userInput', message: 'Build all?', 
+        parameters: [ [
+          $class: 'ChoiceParameterDefinition', 
+          choices: "ALL\nFRONTEND-ONLY\nBACKEND-AND-RULES\nRULES-ONLY",
+          name: 'buildOption'] ])         
+    // Storing result in a file to resolve global variable issue with parallel stages.
+    sh "echo ${buildOption} > buildOption.txt"
+    sh "cat buildOption.txt"
+    echo "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}"
+  }
+}
+
+def getBatchInputBuildOption () {
+  // If no input, then stop.
+  timeout(time: 60, unit: 'SECONDS') {
+    def buildOption = input( id: 'userInput', message: 'Build all?', 
+        parameters: [ [
+          $class: 'ChoiceParameterDefinition', 
+          choices: "State Interface Batch\nTreasury Collection Batch\nTreasury Referral Batch\nTreasury Response Batch\nPay.Gov Batch\nLab Interface Batch",
+          name: 'buildOption'] ])         
+    // Storing result in a file to resolve global variable issue with parallel stages.
+    sh "echo ${buildOption} > buildOption.txt"
+    sh "cat buildOption.txt"
+    echo "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}"
+  }
+}
+
+//def buildAngular (ANGULAR_BUILD_CONFIGURATION, ANGULAR_BASE_PATH) {
+def buildAngulartest (ANGULAR_BUILD_CONFIGURATION_TEST, ANGULAR_BASE_PATH) {
+  // added --aot=false.  With --aot=true, compilation errors would cause it to fail.  To be resolved?
+  // added -- source-map=false
+  nodejs('NodeJS_14_Linux') {
+      sh '''node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration=${ANGULAR_BUILD_CONFIGURATION_TEST} --prod --aot=false --build-optimizer=false --source-map=false --base-href=${ANGULAR_BASE_PATH} --no-progress'''  
+  }
+}
+
+def buildAngularprod (ANGULAR_BUILD_CONFIGURATION_PROD, ANGULAR_BASE_PATH) {
+  // added --aot=false.  With --aot=true, compilation errors would cause it to fail.  To be resolved?
+  // added -- source-map=false
+  nodejs('NodeJS_14_Linux') {
+      sh '''node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng build --configuration=${ANGULAR_BUILD_CONFIGURATION_PROD} --prod --aot=false --build-optimizer=false --source-map=false --base-href=${ANGULAR_BASE_PATH} --no-progress'''  
+  }
+}
+
+def testAngular (ANGULAR_BASE_PATH, ANGULAR_KARMA_CONFIG_FILE) {
+  // To fix error of Karma not waiting for the browser, increased retry limit from 3 to 30.
+  nodejs('NodeJS_14_Linux') {
+      sh '''sed -i 's/browserNoActivityTimeout/retryLimit:30,browserNoActivityTimeout/g' ${ANGULAR_KARMA_CONFIG_FILE}'''
+      sh '''sed -i 's?/imageserver/ui/?${ANGULAR_BASE_PATH}?g' ${ANGULAR_KARMA_CONFIG_FILE}'''
+      sh '''node --max_old_space_size=8192 ./node_modules/@angular/cli/bin/ng test --watch=false --karmaConfig=${ANGULAR_KARMA_CONFIG_FILE} --source-map=false --code-coverage --no-progress'''
+  }
+}
+
+def buildJava (boolean withArtifactory = true) {
+  def goals = 'install --fail-at-end -B -Dmaven.test.skip=true'
+  dir ('ois-app') {
+    if (withArtifactory) {
+      rtMavenRun (
+        goals: goals,
+        resolverId: 'mvn-resolver'
+      )
+    } else {
+      sh "mvn ${goals}"
+    }
+  }
+}
+
+def buildBatchJava (boolean withArtifactory = true, repoName) {
+  def goals = 'install --fail-at-end -B -Dmaven.test.skip=true'
+  dir ("${repoName}") {
+    if (withArtifactory) {
+      rtMavenRun (
+        goals: goals,
+        resolverId: 'mvn-resolver'
+      )
+    } else {
+      sh "mvn ${goals}"
+    }
+  }
+}
+
+def testJava (boolean withArtifactory = true) {
+  def goals = 'test --fail-at-end'
+  dir ('ois-app') {
+    if (withArtifactory) {
+      rtMavenRun (
+        goals: goals,
+        resolverId: 'mvn-resolver'
+      )
+    } else {
+      sh "mvn ${goals}"
+    }
+  }
+}
+
+def sonarScanRepo(repoName) {
+  catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+    dir ("${repoName}") {
+      withSonarQubeEnv('SonarQube') {
+        def scannerHome = tool 'SonarScanner'
+        echo "${scannerHome}"
+        sh "${scannerHome}/bin/sonar-scanner"
+      }
+    }
+  }
+}
+
+// def createSonarProjectPropertyFile_Java(name, BRANCH_NAME, SONAR_SERVER_URL) {
+//   echo "Creating sonar scan file for: ${BRANCH_NAME}-${name}"
+//   sh "echo -en \
+// \"sonar.projectKey=OSHA-OIS-DEV:${BRANCH_NAME}-${name}\n\
+// sonar.host.url=${SONAR_SERVER_URL}\n\
+// sonar.scm.enabled=true\n\
+// sonar.scm.exclusions.disabled=true\n\
+// // sonar.projectBaseDir=/usr/src\n\
+// // sonar.scm.language=java\n\
+// // sonar.lang.patterns.xml=xml\n\
+// // sonar.flow.file.suffixes=none\n\
+// sonar.sources=./,../ois-base/src/main/java,../ois-data-services/src/main/java,../ois-security-services/src/main/java,../ois-document-services/src/main/java,../ois-api-gateway/src/main/java,../ois-user-api/src/main/java,../ois-referencedata-api/src/main/java,../ois-alliance-api/src/main/java,../ois-timetracking-api/src/main/java,../ois-managerefdata-api/src/main/java,../ois-manageformletters-api/src/main/java,../ois-establishment-api/src/main/java,../ois-complianceassistance-api/src/main/java,../ois-enforcement-api/src/main/java,../ois-formlettersdocgen-services/src/main/java,../ois-sampling-api/src/main/java,../ois-selfsampling-api/src/main/java,../ois-penaltycalculator-services/src/main/java,../ois-dcatfunctions-api/src/main/java,../ois-proxy/src/main/java,../ois-consultation-api\n\
+// sonar.java.binaries=../ois-base/target/classes,../ois-data-services/target/classes,../ois-security-services/target/classes,../ois-document-services/target/classes,../ois-user-api/target/classes,../ois-referencedata-api/target/classes,../ois-alliance-api/target/classes,../ois-timetracking-api/target/classes,../ois-managerefdata-api/target/classes,../ois-manageformletters-api/target/classes,../ois-establishment-api/target/classes,../ois-complianceassistance-api/target/classes,../ois-enforcement-api/target/classes,../ois-formlettersdocgen-services/target/classes,../ois-sampling-api/target/classes,../ois-selfsampling-api/target/classes,../ois-penaltycalculator-services/target/classes,../ois-dcatfunctions-api/target/classes,../ois-proxy/target/classes,../ois-consultation-api/target/classes\n\
+// sonar.junit.reportPaths=../**/target/surefire-reports\n\
+// sonar.jacoco.reportPaths=../**/target/coverage-reports/jacoco-ut.exec\" > sonar-project.properties"
+// }
+
+def createSonarProjectPropertyFile_Angular(repoName, BRANCH_NAME, SONAR_SERVER_URL) {
+  dir ("${repoName}") {
+    sh "echo -en \
+\"sonar.projectKey=OSHA-OIS-DEV:${BRANCH_NAME}-${repoName}\n\
+sonar.host.url=${SONAR_SERVER_URL}\n\
+sonar.sources=src\n\
+sonar.language=ts\n\
+sonar.typescript.lcov.reportPaths=coverage/lcov.info\n\
+// sonar.typescript.lcov.reportPaths=./\n\
+sonar.scm.enabled=true\n\
+sonar.scm.provider=git\n\" > sonar-project.properties"
+  }
+}
+
+def getMavenHome() {
+  script {
+    sh (
+      script: 'mvn --version | grep "Maven home" | sed "s/^[^//]*://g" | awk "{print $NF}"',
+      returnStdout: true
+    ).trim()
+  }
+}
+
+def uploadToArtifactory(fileName, serverID, repoName, subDir) {
+  echo "attempting upload to ${repoName}/${subDir}/${fileName}"
+  sh "ls -l ${fileName}"
+  rtUpload (
+    serverId: "${serverID}",
+    buildName: 'Build',
+    spec:
+        """{
+          "files": [
+            {
+              "pattern": "${fileName}",
+              "target": "${repoName}/${subDir}/${fileName}"
+            }
+        ]
+        }""",
+    failNoOp: true
+  )
+}
+
+def downloadFromArtifactory(serverID, sourcePath, destinationPath) {
+  rtDownload (
+    serverId: "${serverID}",
+    spec: """{
+          "files": [
+            {
+              "pattern": "${sourcePath}",
+              "target": "${destinationPath}",
+              "flat": "true"
+            }
+          ]
+    }""",
+    failNoOp: true,
+  )
+}
+
+def checkAndPopulateLocalArtifactoryRepo(serverID, repoName) {
+  // echo "Reenabled.  Was skipping Artifactory jar check due to 500 error from server."
+  echo 'Checking if artifactory already has the local files'
+  script {
+    downloadFromArtifactory(serverID, "${repoName}/net/sf/jodreports/jodreports/2.2.1/jodreports-2.2.1.jar","./")
+    if (fileExists('jodreports-2.2.1.jar')) {
+      echo 'Artifactory already has the local files'
+    } else {
+      echo 'Not found.  Populating artifactory with local jars.'
+      //sh 'cd ois-ci && pwd && ls && cd missingJars && unzip -o missingJars_unzip_in_folder_containing_m2.zip'
+      rtUpload (
+        serverId: "${serverID}",
+        spec:
+            """{
+              "files": [
+                {
+                  "pattern": "ois-ci/local/localJars/aspose-words-18.9-jdk16.jar",
+                  "target": "${repoName}/com/aspose/aspose-words/18.9/"
+                },
+                {
+                  "pattern": "ois-ci/local/localJars/jodreports-2.2.1.jar",
+                  "target": "${repoName}/net/sf/jodreports/jodreports/2.2.1/"
+                }
+            ]
+            }""",
+        failNoOp: true
+      )
+    }
+  }
+}
+
+def sendSSHCommand(serverAddress, sshCommandString) {
+ withCredentials([sshUserPrivateKey(credentialsId: serverCredentialsID, passphraseVariable: 'passphrase', keyFileVariable: 'keyFile')]) {
+ //withCredentials([sshUserPrivateKey(credentialsId: 'qat3-jenkins-ssh', passphraseVariable: '', keyFileVariable: 'keyFile')]) {
+
+    def remote = [:]
+    remote.name = 'test'
+    remote.user = serverCredentialsUser
+    //remote.user = 'tomcat'
+    remote.identityFile = keyFile
+    remote.passphrase = passphrase
+    //remote.passphrase = ''
+    remote.allowAnyHosts = true
+
+    remote.host = serverAddress
+    sshCommand remote: remote, command: sshCommandString
+  }
+}
+
+def sendSSHPut(serverAddress, fromFileString, toFileString)  {
+  withCredentials([sshUserPrivateKey(credentialsId: serverCredentialsID, passphraseVariable: 'passphrase', keyFileVariable: 'keyFile')]) {
+  //withCredentials([sshUserPrivateKey(credentialsId: 'qat3-jenkins-ssh', passphraseVariable: '', keyFileVariable: 'keyFile')]) {
+    def remote = [:]
+    remote.name = 'test'
+    remote.user = serverCredentialsUser
+    //remote.user = 'tomcat'
+    remote.identityFile = keyFile
+    remote.passphrase = passphrase
+    //remote.passphrase = ''
+    remote.allowAnyHosts = true
+
+    remote.host = serverAddress
+    sshPut remote: remote, from: fromFileString, into: toFileString
+  }
+}
+
+// def sendSSHGet(serverAddress, fromFileString, toFileString) {
+//   withCredentials([sshUserPrivateKey(credentialsId: serverCredentialsID, passphraseVariable: 'passphrase', keyFileVariable: 'keyFile')]) {
+
+//     def remote = [:]
+//     remote.name = 'test'
+//     remote.user = serverCredentialsUser
+//     remote.identityFile = keyFile
+//     remote.passphrase = passphrase
+//     remote.allowAnyHosts = true
+
+//     remote.host = serverAddress
+//     sshGet remote: remote, from: fromFileString, into: toFileString, override: true
+//   }
+// }
+
+// def sendSSHRemove(serverAddress, fileString) {
+//   withCredentials([sshUserPrivateKey(credentialsId: serverCredentialsID, passphraseVariable: 'passphrase', keyFileVariable: 'keyFile')]) {
+
+//     def remote = [:]
+//     remote.name = 'test'
+//     remote.user = serverCredentialsUser
+//     remote.identityFile = keyFile
+//     remote.passphrase = passphrase
+//     remote.allowAnyHosts = true
+
+//     remote.host = serverAddress
+//     sshRemove remote: remote, path: fileString
+//   }
+// }
+
+// def sendSSHScript(serverAddress, scriptFilePathString, sleepTime = 5) {
+//   withCredentials([sshUserPrivateKey(credentialsId: serverCredentialsID, passphraseVariable: 'passphrase', keyFileVariable: 'keyFile')]) {
+
+//     def remote = [:]
+//     remote.name = 'test'
+//     remote.user = serverCredentialsUser
+//     remote.identityFile = keyFile
+//     remote.passphrase = passphrase
+//     remote.allowAnyHosts = true
+
+//     remote.host = serverAddress
+//     sshScript remote: remote, script: scriptFilePathString
+//     sh "sleep ${sleepTime}"
+//   }
+// }
+
+def deployDist(server, frontEndZip) {
+  echo "${server}: Deploying /dist to /osha/imageserver/ui/"
+  sendSSHCommand(server, 'hostname && pwd')
+  sendSSHCommand(server, 'cd /osha/imageserver/ui/ && ls -l && rm -rf * && ls -l')
+  sendSSHPut(server, frontEndZip, "/osha/imageserver/ui/${frontEndZip}")
+  sendSSHCommand(server, "cd /osha/imageserver/ui/ && unzip ${frontEndZip} && rm -f ${frontEndZip} && ls -l")
+}
+
+def deployBatchJar(server, batchJarFile) {
+  echo "${server}: Deploying /target/${batchJarFile} to /osha/si/StateInterfaceBatch/"
+  sendSSHCommand(server, 'hostname && pwd')
+  //sendSSHCommand(server, 'cd /osha/si/StateInterfaceBatch/ && ls -l && rm -rf ${batchJarFile} && ls -l')
+  sendSSHPut(server, batchJarFile, "/osha/si/StateInterfaceBatch/${batchJarFile}")
+  sendSSHCommand(server, "cd /osha/si/StateInterfaceBatch/ && ls -l")
+}
+
+def deployWarRoot(server, backendZip) {
+  echo "${server}: Deploying ROOT.war to /osha/tomcat/webapps/"
+  sh "unzip -p ${backendZip} ROOT.war > ROOT.war"
+  sendSSHCommand(server, 'hostname && pwd')
+  sendSSHCommand(server, "cd /osha/tomcat/webapps/ && ls -l && rm -f ROOT.war && $rmDirsExceptManager && ls -l")
+  sendSSHPut(server, 'ROOT.war', "/osha/tomcat/webapps/ROOT.war")
+  sendSSHCommand(server, "cd /osha/tomcat/webapps/ && ls -l")
+}
+
+def deployWarsExceptRoot(server, backendZip) {
+  echo "${server}: Deploying .war files to /osha/tomcat/webapps/ (except ROOT.war)"
+  sendSSHCommand(server, 'hostname && pwd')
+  sendSSHCommand(server, "cd /osha/tomcat/webapps/ && ls -l && rm -rf *.war && $rmDirsExceptManager && ls -l")
+  sendSSHPut(server, backendZip, "/osha/tomcat/webapps/${backendZip}")
+  sendSSHCommand(server, "cd /osha/tomcat/webapps/ && unzip ${backendZip} -x ROOT.war && rm *.zip && ls -l")
+}
+
+def stopTomcat(server) {
+  echo "${server}: Stopping Tomcat"
+  sendSSHCommand(server, '/osha/tomcat/bin/shutdown.sh || true')
+}
+
+def startTomcat(server) {
+  echo "${server}: Starting Tomcat"
+  sendSSHCommand(server, 'hostname && pwd && ls -l /osha/tomcat/bin')
+  sendSSHCommand(server, '/osha/tomcat/bin/startup.sh || true')
+}
+
+def deployRules(server, rulesZip) {
+  echo "${server}: Deploying rules"
+  sendSSHCommand(server, 'hostname && pwd && ls -l /osha/')
+  sendSSHCommand(server, 'cd /osha/config/rules/ && ls -l && rm -f * && ls -l')
+  echo "test"
+  sendSSHPut(server, rulesZip, "/osha/config/rules/${rulesZip}")
+  echo "test"
+  sendSSHCommand(server, "cd /osha/config/rules/ && unzip ${rulesZip} && rm -f ${rulesZip} && ls -l")
+}
+
+return this
