@@ -1,0 +1,376 @@
+@Library('shared') _
+// Imported Library: Shared Groovy variables and functions are found in the ./vars folder.  
+// Jenkins: In the config for this pipeline, under "Pipeline Libraries"
+
+pipeline {
+  agent { label 'linux' }
+  triggers {
+      // Builds once daily at 8am
+      cron('00 08 * * *')
+  }
+  environment {
+    // This is the name the sub directory in Artifactory.
+    // Update it at the beginning of each sprint.  
+    ARTIFACTORY_REPO_SUB_DIRECTORY = "FY22.Q2.S1"
+
+    // The builds from this ois-ci branch will be stored in Artifactory.
+    ARTIFACTORY_BRANCH='FY22.Q2.S1'
+
+    ARTIFACTORY_SERVER_ID = 'OSHA-OIS'
+    ARTIFACTORY_REPO_NAME = 'OSHA-OIS-VIRTUAL'
+    ARTIFACTORY_REPO_NAME_LOCAL = 'OSHA-OIS'
+
+    GIT_CREDENTIALS_ID = 's-osha-ois-GItLab-Token'
+    GIT_URL = 'https://devops.dol.gov/gitlab/osha_ois'
+
+    SERVERS_API='osha-ois-dev01-tomcat-use1.dol.gov,osha-ois-test01-tomcat.use1.dol.gov'
+    SERVERS_PROXY='osha-ois-dev01-tomcat-proxy-use1.dol.gov,osha-ois-test01-Tomcat-Proxy-use1.dol.gov'
+
+    SONAR_SERVER_URL = 'https://devops.dol.gov/sonar'
+
+    // ARTIFACT NAMING
+    FRONTEND_PACKAGED_ZIP_FILE = 'feDistFolderFiles.zip'
+    BACKEND_PACKAGED_ZIP_FILE= 'beWarFiles.zip'
+    RULES_PACKAGED_ZIP_FILE = 'ruleFiles.zip'
+
+    // APPLICATION SETTINGS
+    //ANGULAR_BUILD_CONFIGURATION = 'qat2'
+    ANGULAR_BUILD_CONFIGURATION_TEST = 'qat2'
+    ANGULAR_BUILD_CONFIGURATION_PROD = 'production'
+    ANGULAR_BASE_PATH='/imageserver/ui/'
+    ANGULAR_KARMA_CONFIG_FILE = 'karma-jenkins.config.js'
+    FRONT_END_REPO_NAME = 'ois-ui-app'
+
+    BUILD_USER_ID = "${currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause').userName[0]}"
+  }
+
+  options {
+    buildDiscarder(logRotator(daysToKeepStr: '10', numToKeepStr: '20', artifactNumToKeepStr: '20'))
+    // skipDefaultCheckout()
+    timeout(time: 60, unit: 'MINUTES') 
+  }
+
+  stages {
+
+    stage('Setup') {
+      steps {
+        sh '''whoami && pwd && ls'''
+        // Remove all in directory
+        sh '''find . -mindepth 1 -delete'''
+        sh '''ls'''
+        script {
+          env.MAVEN_HOME=shared.getMavenHome()
+          shared.cloneRepo("ois-ci", env.BRANCH_NAME, GIT_URL, GIT_CREDENTIALS_ID)
+          env.NODEJS_HOME = "${tool 'NodeJS_14_Linux'}"
+          env.PATH="${env.NODEJS_HOME}/bin:${env.PATH}"
+          rtNpmResolver (
+            id: 'npm-resolver',
+            serverId: "${ARTIFACTORY_SERVER_ID}",
+            repo: "${ARTIFACTORY_REPO_NAME}"
+          )
+        }
+        rtMavenResolver (
+          id: 'mvn-resolver',
+          serverId: "${ARTIFACTORY_SERVER_ID}",
+          // releaseRepo: 'mvn',
+          // snapshotRepo: 'mvn'
+          releaseRepo: "${ARTIFACTORY_REPO_NAME}",
+          snapshotRepo: "${ARTIFACTORY_REPO_NAME}"
+        )
+        // set buildOption default.
+        // sh 'echo "ALL" > buildOption.txt'
+        sh 'echo "ALL" > buildOption.txt'
+      }
+    }
+
+    // If IS_MANUALLY_STARTED NOT null, 
+    // then provide build choices of "ALL", "BACKEND-AND-RULES", OR "FRONTEND-ONLY".
+    // After 30 seconds, it continues and defaults to "ALL" (in setup stage).
+    stage('Select Build') {
+      when { 
+        expression{ !BUILD_USER_ID.equals("null") }
+      }
+      steps {
+        script {
+          echo "Manually started by user: ${BUILD_USER_ID}"
+          echo "${expression{ BUILD_USER_ID }}"
+          shared.getInputBuildOption()
+        }
+      }
+    }
+ 
+    stage('Build & Test') {
+      parallel {
+        stage ('FE') {
+          when {
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|FRONTEND-ONLY)/}
+          }
+          stages () {
+            stage ('Clone FE') {
+              steps {
+                script {
+                  shared.cloneRepo("${FRONT_END_REPO_NAME}", env.BRANCH_NAME, GIT_URL, GIT_CREDENTIALS_ID)
+                }
+                dir ("${FRONT_END_REPO_NAME}") {
+                  script {
+                    nodejs("NodeJS_14_Linux") {
+                      sh "npm -v && ng --version"
+                      sh "npm ci"
+                    }
+                  }
+                }
+              }
+            }
+            stage('Test FE') {
+              steps {
+                dir ("${FRONT_END_REPO_NAME}") {
+                  catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    script {
+                      shared.testAngular(ANGULAR_BASE_PATH, ANGULAR_KARMA_CONFIG_FILE)
+                    }
+                  }
+                }
+              }
+            }
+            stage ('Build FE') {
+              steps {
+                // sh "touch ${FRONTEND_PACKAGED_ZIP_FILE}"
+                dir ("${FRONT_END_REPO_NAME}") {
+                  script {
+                    //shared.buildAngular("qat2", ANGULAR_BASE_PATH)
+                    shared.buildAngulartest(ANGULAR_BUILD_CONFIGURATION_TEST, ANGULAR_BASE_PATH)
+                  }
+                  // Create .zip of front end files.
+                  sh "cd dist/ && zip -r -m ${FRONTEND_PACKAGED_ZIP_FILE} . && mv ${FRONTEND_PACKAGED_ZIP_FILE} ../../"
+                }
+              }
+            }
+            stage('Sonar Scan FE') {
+              steps {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                  script {
+                    shared.createSonarProjectPropertyFile_Angular(FRONT_END_REPO_NAME, env.BRANCH_NAME, SONAR_SERVER_URL) 
+                    shared.sonarScanRepo(FRONT_END_REPO_NAME)
+                  }
+                }
+              }
+            }
+          }
+        }
+        stage ('BE') {
+          when {
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|BACKEND-AND-RULES)/}
+          }
+          stages () {
+            stage ('Clone BE') {
+              steps {
+                script {
+                  shared.backendRepoNamesArray.each {
+                      shared.cloneRepo(it, env.BRANCH_NAME, GIT_URL, GIT_CREDENTIALS_ID)
+                  }
+                  shared.checkAndPopulateLocalArtifactoryRepo(ARTIFACTORY_SERVER_ID, ARTIFACTORY_REPO_NAME_LOCAL ) 
+                }
+              }
+            }
+            stage('Unit Test BE') {
+              steps {
+                script {
+                  catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    shared.testJava()
+                  }
+                }
+              }
+            }
+            stage ('Build BE') {
+              steps {
+                script {
+                  shared.buildJava()
+                }
+                // Create .zip of .war files.  Not compressing since .wars are already.
+                sh """find . -path "**/*/target/*.war" | zip -@ -j -m -Z store ${BACKEND_PACKAGED_ZIP_FILE}"""
+              }
+            }
+            stage('Sonar Scan BE') {
+              steps {
+                script {
+                  catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    dir ("ois-app") {
+                      withSonarQubeEnv('SonarQube') {
+                        rtMavenRun (
+                          goals: """sonar:sonar -Dsonar.lang.patterns.flow=**/*.ndf -Dsonar.projectKey="OSHA-OIS-DEV:${env.BRANCH_NAME}-APIs" """,
+                          resolverId: 'mvn-resolver'
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        stage ('Rules') {
+          when {
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|BACKEND-AND-RULES|RULES-ONLY)/}
+          }
+          // Nested only for consistency of the UI presentation.
+          stages () {
+            stage ('Package Rules') {
+              steps {
+                script {
+                  // If RULES-ONLY, then clone.  Otherwise, wait for BE to clone.
+                  if ("${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(RULES-ONLY)/) {
+                    shared.cloneRepo("ois-penaltycalculator-services", env.BRANCH_NAME, GIT_URL, GIT_CREDENTIALS_ID)
+                  } else {
+                    timeout(time: 5, unit: 'MINUTES') {
+                      waitUntil {fileExists('ois-penaltycalculator-services/pom.xml')}
+                      // Wait a little longer to ensure BE has finished cloning.
+                      sleep 10
+                    }
+                  }
+                  // Create .zip of rules files.
+                  sh "cd ois-penaltycalculator-services/src/main/resources/ && zip ${RULES_PACKAGED_ZIP_FILE} ./*.drl && ls -l *.zip && mv ${RULES_PACKAGED_ZIP_FILE} ../../../../"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Stop Servers') {
+      steps {
+        script {
+          env.SERVERS_API.tokenize(",").each { server ->
+            shared.stopTomcat(server)
+          }
+          env.SERVERS_PROXY.tokenize(",").each { server ->
+            shared.stopTomcat(server)
+          }
+          sleep 30
+        }
+      }
+    }
+
+    stage('Deploy') {
+      parallel {
+        stage ("Deploy FE") {
+          when {
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|FRONTEND-ONLY)/}
+          }
+          steps {
+            script {
+              env.SERVERS_PROXY.tokenize(",").each { server ->
+                shared.deployDist(server, FRONTEND_PACKAGED_ZIP_FILE)
+              }
+            }
+          }
+        }
+        stage ("Deploy BE") {
+          when {
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|BACKEND-AND-RULES)/}
+          }
+          steps {
+            // Deploy ROOT.war to Proxy
+            script {
+              env.SERVERS_PROXY.tokenize(",").each { server ->
+                shared.deployWarRoot(server, BACKEND_PACKAGED_ZIP_FILE)
+              }
+            // Deploy other wars to API server
+              env.SERVERS_API.tokenize(",").each { server ->
+                shared.deployWarsExceptRoot(server, BACKEND_PACKAGED_ZIP_FILE)
+              }
+            }
+          }
+        }
+        stage ("Deploy Rules") {
+          when {
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|BACKEND-AND-RULES|RULES-ONLY)/}
+          }
+          steps {
+            script { 
+              env.SERVERS_API.tokenize(",").each { server ->
+                shared.deployRules(server, RULES_PACKAGED_ZIP_FILE)
+                //test
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Start Servers') {
+      steps {
+        script {
+          env.SERVERS_API.tokenize(",").each { server ->
+            shared.startTomcat(server)
+          }
+          env.SERVERS_PROXY.tokenize(",").each { server ->
+            shared.startTomcat(server)
+          }
+        }
+      }
+    }
+
+    // Always deploys folder.  FE & BE, when ALL or specified.
+    stage('Store Artifacts') {
+      parallel {
+        stage ("Store BE") {
+          when {
+            branch "${ARTIFACTORY_BRANCH}"
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|BACKEND-AND-RULES)/}
+          }
+          steps {
+            script {
+              shared.uploadToArtifactory(BACKEND_PACKAGED_ZIP_FILE, ARTIFACTORY_SERVER_ID, ARTIFACTORY_REPO_NAME_LOCAL, ARTIFACTORY_REPO_SUB_DIRECTORY)
+            }
+          }
+        }
+        stage ('Store FE'){
+          when {
+            branch "${ARTIFACTORY_BRANCH}"
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|FRONTEND-ONLY)/}
+          }
+          stages () {
+            stage ('Build FE Prod') {
+              steps {
+                // sh "touch ${FRONTEND_PACKAGED_ZIP_FILE}"
+                dir ("${FRONT_END_REPO_NAME}") {
+                  script {
+                    //shared.buildAngular("Prod", ANGULAR_BASE_PATH)
+                    shared.buildAngularprod(ANGULAR_BUILD_CONFIGURATION_PROD, ANGULAR_BASE_PATH)
+                  }
+                  // Create .zip of front end files.
+                  sh "cd dist/ && zip -r -m ${FRONTEND_PACKAGED_ZIP_FILE} . && mv ${FRONTEND_PACKAGED_ZIP_FILE} ../../"
+                }
+              }
+            }
+            stage('upload FE'){
+              steps {
+                script {
+                  shared.uploadToArtifactory(FRONTEND_PACKAGED_ZIP_FILE, ARTIFACTORY_SERVER_ID, ARTIFACTORY_REPO_NAME_LOCAL, ARTIFACTORY_REPO_SUB_DIRECTORY)
+                }
+              }
+            }
+          }
+        }
+        stage('Store Rules') {
+          when {
+            branch "${ARTIFACTORY_BRANCH}"
+            expression{ "${sh (script: 'cat buildOption.txt',returnStdout: true).trim()}" ==~ /(ALL|BACKEND-AND-RULES|RULES-ONLY)/}
+          }
+          steps {
+            sh "ls -l"
+            script {
+              shared.uploadToArtifactory(RULES_PACKAGED_ZIP_FILE, ARTIFACTORY_SERVER_ID, ARTIFACTORY_REPO_NAME_LOCAL, ARTIFACTORY_REPO_SUB_DIRECTORY)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post { 
+    always { 
+      cleanWs()
+    }
+  }
+} 
