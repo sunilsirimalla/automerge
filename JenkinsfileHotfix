@@ -1,0 +1,258 @@
+#!groovy
+// Jenkinsfile for Hotfix Daily Automerge Task. Make sure to update the hotfix branch names after every Sprint Deployment
+import com.optum.jenkins.pipeline.library.scm.Git
+import java.text.SimpleDateFormat
+@Library('com.optum.jenkins.pipeline.library@stable') _
+@Library('codePipelineLib@master') __
+
+def mergeOrCreatePR(service) {
+  withCredentials([usernamePassword(credentialsId: '8d1302bf-cb16-4212-b238-9c94dbccef4e', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASSWORD')]) {
+    // SOURCE_URL = "https://github.optum.com/IntegratedEligibility/${service}"
+    SOURCE_URL = params.SOURCE_URL
+    // TARGET_URL = "https://github.optum.com/WV-IE/${service}"
+    TARGET_URL = params.TARGET_URL
+    echo "SOURCE_URL - ${SOURCE_URL}"
+    echo "TARGET_URL - ${TARGET_URL}"
+    sourceRepo = SOURCE_URL.replaceAll('https://github.optum.com/','')
+    targetRepo = TARGET_URL.replaceAll('https://github.optum.com/','')
+    echo "sourceRepo is ${sourceRepo}"
+    echo "targetRepo is ${targetRepo}"
+    sourceBranch = params.sourceBranch
+    targetBranch = params.targetBranch
+    echo "sourceBranch is ${sourceRepo}/${sourceBranch}"
+    echo "targetBranch is ${targetRepo}/${targetBranch}"
+    def jenkinsWorkspace = env.WORKSPACE
+    echo "jenkinsWorkspace is ${jenkinsWorkspace}"
+    def emailRecipients = params.emailRecipients
+    echo "email recipients for PR generation and hotfix merge conflict updates are - ${emailRecipients}"
+    def dateAndTime = new Date()
+    echo "date and time - ${dateAndTime}"
+    def sdf1 = new SimpleDateFormat("MM-dd-yyyy")
+    def sdf2 = new SimpleDateFormat("MM-dd-yyyy_HH.mm.ss")
+    def date = sdf1.format(dateAndTime)
+    def time = sdf2.format(dateAndTime)
+    // def String newBranch = "automergeBranch_${date}"
+    def String newBranch = "hotfixAutomergeBranchNew"
+
+    String[] msids = params.Reviewers.split(", ") // Splits at the comma into a String[]
+    String reviewersList = ""
+    for (int i = 0; i < msids.length; i++) {
+        if (i == msids.length-1) {
+            // If this is the last string, don't add a comma
+            reviewersList += "\"" + msids[i] + "\""
+        }
+        else {
+            reviewersList += "\"" + msids[i] + "\","
+        }
+    }
+    echo "reviewersList is - ${reviewersList}"
+
+    sh """#!/bin/bash
+      echo "Entered shell to clone the parameterized hotfix branches of the source and target repos"
+      git config user.name "${GIT_USER}"
+      git config user.email "${GIT_USER}@optum.com"
+      git clone --single-branch --branch ${sourceBranch} ${SOURCE_URL} ${sourceRepo}
+      cd ${sourceRepo}
+      git log origin/${sourceBranch} | head -1 > getHash.txt
+      cat getHash.txt
+      cd ..
+      cd ..
+      git clone --single-branch --branch ${targetBranch} ${TARGET_URL} ${targetRepo}
+      cd ${targetRepo} 
+      git checkout ${targetBranch}
+      git rev-list --max-parents=0 HEAD | tail -n 1 > firstCommit.txt
+      if git checkout ${newBranch}; then
+        echo "Hotfix automerge branch is already available - This means the previous PR is either merged and not deleted or not merged yet. Let's delete this branch (will delete the PR if not merged)"
+        git push --set-upstream https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@github.optum.com/${targetRepo} -d ${newBranch}
+      else
+        git checkout -b ${newBranch} ${targetBranch}
+      fi
+    """
+    firstCommit = sh(script: "cat ${jenkinsWorkspace}/${targetRepo}/firstCommit.txt", returnStdout: true).trim()
+    sh """#!/bin/bash
+      echo "Entered shell to push latest code to ${newBranch}"
+      cd ${targetRepo}
+      git checkout ${newBranch}
+      git reset --hard ${firstCommit}
+      git pull ${jenkinsWorkspace}/${sourceRepo} ${sourceBranch}
+      git push origin ${newBranch}
+      git push --set-upstream https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@github.optum.com/${targetRepo} ${newBranch}
+      echo "Pushed latest Code from ${sourceRepo}/${sourceBranch} to ${targetRepo}/${newBranch} intermediate branch"
+    """
+    getHash = sh(script: "cat ${jenkinsWorkspace}/${sourceRepo}/getHash.txt", returnStdout: true).trim()
+    // echo "getHash is ${getHash}"
+    commitID = getHash.replaceAll('commit ', '').trim()
+    // echo "commitID is ${commitID}"
+    userID = sh(script: "curl https://github.optum.com/api/v3/repos/${sourceRepo}/commits/${commitID}", returnStdout: true).trim()
+    writeJSON(file: 'commitData.json', json: userID)
+    // echo "Commit Data is as follow: ${userID}"
+    def commitData = ''
+    def commitAuthor = ''
+    def commitUserName = ''
+    def prBody = ""
+    commitData = readJSON file: 'commitData.json'
+    commitAuthor = commitData.author
+    // echo "commitAuthor is ${commitAuthor}"
+    commitUserName = commitAuthor.login
+    echo "commitUserName is ${commitUserName}"
+    if (commitUserName) {
+      commitUserName = '@' + commitUserName
+      prBody = "<h2>PR GENERATED BY JENKINS AUTOMERGE TASK - ${time}</h2> <h3>When:</h3>When merging <code><b>${sourceRepo}/${sourceBranch}</b></code> --> <code><b>${targetRepo}/${targetBranch}</b></code>. <br/> <h3>Who:</h3> Hey ${commitUserName}, can you please review and merge the PR :eyes: <br/> <h3>PLEASE DELETE THE BRANCH ${newBranch} AFTER PR MERGE</h3>"
+      // Replace commitUserName with ${commitUserName} during execution
+    } else {
+      prBody = "<h2>PR GENERATED BY JENKINS AUTOMERGE TASK - ${time}</h2> <h3>When:</h3>When merging <code><b>${sourceRepo}/${sourceBranch}</b></code> --> <code><b>${targetRepo}/${targetBranch}</b></code>. <br/> <h3>Who:</h3> Please review and merge the PR :eyes: <br/> <h3>PLEASE DELETE THE BRANCH ${newBranch} AFTER PR MERGE</h3>"
+    }
+    echo "prBody is - ${prBody}"
+
+    if (params.automerge == true) {
+      echo "HotfixMerge - Automerge is Enabled - Jenkins will try to merge ${newBranch} to ${targetBranch} and create a merge conflict PR if merge conflicts occur"
+      try {
+        sh """#!/bin/bash
+          echo "Entered shell to execute branch merge process"
+          cd ${targetRepo}
+          git checkout ${newBranch}
+          git checkout ${targetBranch}
+          if git pull ${jenkinsWorkspace}/${targetRepo} ${newBranch} > mergeOutput.txt ; then
+            echo "Entered if condition in Try Block. This indicates merge is successful"
+            git push -u https://${GIT_USER}:\$(python -c "import urllib, sys; print urllib.quote(sys.argv[1])"  "${GIT_PASSWORD}")@github.optum.com/${targetRepo} ${targetBranch} 
+            echo "Latest code merged from ${newBranch} to ${targetBranch}"
+          else
+            echo "Entered else in Try Block. This means merge process failed. Merge will Abort and pipeline enters the catch block to create a PR"
+            git merge --abort
+            exit 1
+          fi
+        """ 
+        mergeOutput = sh(script: "cat ${jenkinsWorkspace}/${targetRepo}/mergeOutput.txt", returnStdout: true).trim()
+        emailext(
+          subject: "HotfixMerge - ${service} - Automatically Merged hotfix code from IE to WV-IE - No Action Needed",
+          body: """Hello,
+          This email is to notify that the hotfix code for service ${service} has been automatically merged from ${sourceRepo}/${sourceBranch} to ${targetRepo}/${targetBranch} by Jenkins at ${time}.
+          Merge Output:
+          ${mergeOutput}
+          """,
+          recipientProviders: [[$class: 'DevelopersRecipientProvider']], to: "${emailRecipients}"
+        )
+      } // End of Try Block for Automerge Enabled (Exception Handling)
+      catch (Exception e) {
+        sh """#!/bin/bash
+          echo "Entered shell in catch block to execute merge conflict PR creation"
+          curl -s -u ${GIT_USER}:${GIT_PASSWORD} -d '{"reviewers": [${reviewersList}]}' \$(curl -u ${GIT_USER}:${GIT_PASSWORD} -d '{"title": "Hotfix branch Merge Conflict PR Generated by Jenkins for ${service}", "body": "${prBody}", "head": "${newBranch}", "base": "${targetBranch}", "maintainer_can_modify": true}' https://github.optum.com/api/v3/repos/${targetRepo}/pulls | jq -r '.url')/requested_reviewers > prData.txt
+          echo "New PR is now created"
+        """
+      } // End of Catch Block for Automerge Enabled (Exception Handling)
+    } // End of If condition - Automerge Enabled
+    else {
+      echo "HotfixMerge - Automerge is Disabled - Jenkins will create a PR to manually resolve conflicts (if any) and merge ${newBranch} to ${targetBranch}"
+      sh """#!/bin/bash
+        echo "Entered shell in catch block to execute merge conflict PR creation"
+        curl -s -u ${GIT_USER}:${GIT_PASSWORD} -d '{"reviewers": [${reviewersList}]}' \$(curl -u ${GIT_USER}:${GIT_PASSWORD} -d '{"title": "Hotfix branch Merge Conflict PR Generated by Jenkins for ${service}", "body": "${prBody}", "head": "${newBranch}", "base": "${targetBranch}", "maintainer_can_modify": true}' https://github.optum.com/api/v3/repos/${targetRepo}/pulls | jq -r '.url')/requested_reviewers > prData.txt
+        echo "New PR is now created"
+      """
+    } // End of Else condition - Automerge Disabled
+
+    try {
+      def prData = ''
+      prData = sh(script: "cat ${jenkinsWorkspace}/prData.txt", returnStdout: true).trim()
+      // prData = sh(script: "cat ${jenkinsWorkspace}/${targetRepo}/prData.txt", returnStdout: true).trim()
+      // echo "prData is ${prData}"
+      if (prData) {
+        writeJSON(file: 'prInfo.json', json: prData)
+        def prInfo = ''
+        def prURL = ''
+        prInfo = readJSON file: 'prInfo.json'
+        prURL = prInfo.html_url
+        echo "prURL is ${prURL}"
+        if (prURL != null) {
+          emailext(
+            subject: "HotfixMerge - ${service} - PR Generated by Jenkins - Action Needed",
+            body: """Hello,
+            This email is to notify that an Automated PR is generated by Jenkins to merge hotfix code for _${service}_, from _${sourceRepo}_ to _${targetRepo}_
+            Please review and resolve the conflicts (if any) and merge the PR
+            Link to the PR - ${prURL}
+            """,
+            recipientProviders: [[$class: 'DevelopersRecipientProvider']], to: "${emailRecipients}"
+          ) // End of Email Notification script for PR Generation
+        } // End of IF condition for PR Generation Email
+        else {
+          emailext(
+            subject: "HotfixMerge - ${service} - PR Still Open - Action Needed",
+            body: """Hello,
+            This email is to notify that there is an existing PR still open to hotfix code for _${service}_, from _${sourceRepo}_ to _${targetRepo}_
+            Please review and resolve the conflicts (if any) and merge the open PR/s at ${TARGET_URL}/pulls?q=is%3Aopen+is%3Apr+head%3A${newBranch}
+            """,
+            recipientProviders: [[$class: 'DevelopersRecipientProvider']], to: "${emailRecipients}"
+          ) // End of Email Notification script to check existing open PRs
+        } // End of Else condition for PR Generation Email 
+      } // End of IF condition for PR Generation Email
+      else {
+        echo "This means there is no PR Generation."
+      } // End of Else script for PR Check Email
+    } // End of Try block for PR Generation Email
+    catch (Exception p)
+    {
+      echo "Inside PR Email Catch Block. This means there is no PR Generated."
+    } // End of Catch block for PR Generation Email
+  } // End of with credentials
+} // End of method mergeOrCreatePR()
+
+pipeline {
+  agent any
+  stages{
+    stage('autoMerge') {
+      steps {
+            script {
+              def service = params.TARGET_URL.replaceFirst(/^.*\/([^\/]+?)$/, '$1')
+              // def service = env.GIT_URL.replaceFirst(/^.*\/([^\/]+?).git$/, '$1')
+              echo "Git Repo is ${service}"
+              if (params.sourceBranch?.trim()) {
+                if (params.targetBranch?.trim()) {
+                  mergeOrCreatePR(service)
+                }
+                else {
+                  echo "No input for Target Branch Parameter"
+                  emailext(
+                    subject: "HotfixMerge - ${service} - No HotFix branch input for Target Repo - Action Needed",
+                    body: """Hello,
+                    This email is to notify that there is no input given for Target Branch to merge hotfix for ${service}.
+                    Please find the hotfix branch from target Repo and input the Target HotFix branch into the Jenkins Job.
+                    Target Repo URL -  ${params.TARGET_URL}
+                    Jenkins Job - https://jenkins-wvpath.origin-ctc-core-nonprod.optum.com/job/WVIE/job/WVIE_Dev/job/UI_CodeMerge/job/Hotfix_CodeMerge/job/hotfix-${service}
+                    NOTE: PLEASE IGNORE IF NO HOTFIX BRANCH/MERGE NEEDED FOR THIS REPO FOR THIS SPRINT
+                    """,
+                    recipientProviders: [[$class: 'DevelopersRecipientProvider']], to: "${params.emailRecipients}"
+                  ) // Update the Jenkins Job URL with correct path once testing is complete
+                }
+              }
+              else {
+                echo "No input for Source Branch Parameter"
+                emailext(
+                  subject: "HotfixMerge - ${service} - No HotFix branch input for Source Repo - Action Needed",
+                  body: """Hello,
+                  This email is to notify that there is no input given for Source Branch to merge hotfix for ${service}.
+                  Please find the hotfix branch from target Repo and input the Target HotFix branch into the Jenkins Job.
+                  Target Repo URL -  ${params.SOURCE_URL}
+                  Jenkins Job - https://jenkins-wvpath.origin-ctc-core-nonprod.optum.com/job/WVIE/job/WVIE_Dev/job/UI_CodeMerge/job/Hotfix_CodeMerge/job/hotfix-${service}
+                  NOTE: PLEASE IGNORE IF NO HOTFIX BRANCH/MERGE NEEDED FOR THIS REPO FOR THIS SPRINT
+                  """,
+                  recipientProviders: [[$class: 'DevelopersRecipientProvider']], to: "${params.emailRecipients}"
+                ) // Update the Jenkins Job URL with correct path once testing is complete
+              }
+              // mergeOrCreatePR(service)
+            } 
+      }
+    } // End of mergeBranches Stage
+  } // End of Stages
+  post { 
+    always { 
+      cleanWs()
+    } //
+  } // End of Post Stage Clean Up
+} // End of Pipeline
+
+// removed these lines from shell script
+// reviewersList=\$(echo \${reviewersList})
+// mail -s 'Reviewers Notification - Merge Conflict from ${sourceRepo} to ${targetRepo}' sunil.sirimalla@optum.com <<< 'Merge conflict from ${sourceRepo}/${source} to ${targetRepo}/${target}. Please review ${TARGET_URL}/pulls?q=is%3Aopen+is%3Apr.'
+// Open Pull Requests for a Git Repository - ${TARGET_URL}/pulls?q=is%3Aopen+is%3Apr or https://github.optum.com/ssirimal/dynamic-ui-framework/pulls?q=is%3Aopen+is%3Apr
+//GIT_PASS_URL_ENCODED = URLEncoder.encode(GIT_PASSWORD)
+// GIT_CREDENTIALS = ${GIT_USER}:${GIT_PASSWORD}
+// first commit - git rev-list --max-parents=0 HEAD
